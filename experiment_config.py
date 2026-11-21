@@ -1,0 +1,46 @@
+"""Editable inputs for the SWE-bench/OpenHands replay experiment."""
+
+from pathlib import Path
+
+from sim.config import Experiment, Profile, Sources
+
+TRACE_ROOT = Path.home() / "codes" / "experiment-jetson"
+
+CONFIG = Experiment(
+    sources=Sources(
+        token_csv=TRACE_ROOT / "20261117_swe_llm_trace_tokens/results/run_001/per_call_tokens.csv",
+        swe_batch=TRACE_ROOT / "SWE_Bench_arm64/results/20261013_memory_heavy_resource_maxiter40",
+        instances=(
+            "pydata__xarray-6721",
+            "scikit-learn__scikit-learn-25232",
+            "astropy__astropy-14995",
+        ),
+    ),
+    profile=Profile(
+        dram_gib=16,
+        static_gib=6,
+        kv_bytes_per_token=112 * 1024,
+        # Aggregate token/s indexed by batch size 1 through 8. Only size 1
+        # is anchored to the historical Jetson replay.
+        prefill_tps=(2500, 2875, 3250, 3625, 4000, 4375, 4750, 5125),
+        decode_tps=(20, 36, 48, 59, 68, 75, 81, 87),
+        max_batch=8,
+        prefill_chunk_tokens=2048,
+        kv_evict_s=0.200,
+        tool_save_s=15.027,
+        tool_write_s=1.226,
+        tool_release_s=0.153,
+        tool_read_s=1.226,
+        tool_restore_s=7.719,
+        tool_restore_peak_mib=363.480,
+        prefix_fraction=1.0,
+    ),
+    concurrency=(1, 2, 3, 4, 6, 8),
+    inference_splits=(50, 60, 70, 80, 90, 95),
+    seeds=(0, 1, 2),
+    stagger_max_s=10,
+    sensitivity_concurrency=(4, 6, 8),
+    sensitivity_dram_gib=(14, 24),
+    sensitivity_prefix_fraction=0.5,
+    sensitivity_restore_factors=(0.5, 2.0),
+)

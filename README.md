@@ -1,0 +1,54 @@
+# 统一内存 Agent workload 仿真
+
+用 SWE-bench/OpenHands 多轮轨迹重放单台统一内存设备上的本地推理与工具执行。比较固定分区、同预算共享池和宽预算诊断组，衡量高负载下的内存排队、KV 重算、工具恢复与端到端完成表现。
+
+## 运行
+
+需要 Python 3.10 或更新版本和本地历史 trace。仿真使用标准库，可在普通主机运行。参数入口为 [experiment_config.py](experiment_config.py)，其中的 `TRACE_ROOT` 默认指向 `~/codes/experiment-jetson`。
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 -m sim run --config experiment_config.py --out results/v1
+```
+
+每次运行指定一个新目录。加上 `--quick` 可用第一个 seed 检查主配置的最低与最高并发。全量运行每进入一个场景会打印进度，`status.json` 记录执行状态。
+
+## 数据与内存账本
+
+- 导入同批 Xarray、scikit-learn、Astropy 的 `per_call_tokens.csv`、`tool_calls.csv`、`resources.csv` 和 `summary.json`。推理回合按响应 ID 关联工具调用，一轮中重叠的工具区间按时长并集重放。常驻量取首末工具窗口之间的有效空闲样本中位数，每条轨迹的执行期统一使用其工具窗口内的采样峰值。工具开销包含 OpenHands 轨迹中的调用到返回时间。
+- 推理以历史请求输入和输出 token 数估计本地请求规模，用历史缓存读取量近似同一 Agent 的前缀。新 token 按配置中的 prefill 和 decode 批吞吐处理。每次准入预留当轮峰值 KV，推理推进时把预留量转为物理驻留，下一轮只复用该 Agent 自身的前缀。恢复时只重算丢失的可复用前缀，恢复在批边界独占 GPU。
+- 工具保留环境常驻量，工作期间占用执行峰值。空闲环境经过保存、写入与释放阶段后才交还 DRAM。恢复预留执行与恢复峰值中的较大值，读盘和恢复可以与其他 agent 的执行重叠。磁盘读写使用同一个 FIFO 通道。历史恢复总时长用于校准，读盘份额是配置代理。
+- 固定分区在扣除静态保留后限制每一侧额度。共享池仅放开两侧额度限制，同时检查总 DRAM；两组都按相同的本侧 LRU 选择空闲状态。申请可等待内存或回收完成。超过硬上限和两侧均无法继续前进分别记录。宽预算组提供容量充足时的参考。
+
+## 结果
+
+| 文件 | 内容 |
+| --- | --- |
+| `config.json`、`sources.json` | 生效参数、场景配置、配置与 trace 源文件的 SHA-256 |
+| `traces.json`、`workloads.json` | 归一化 trace 与各对照组共用的到达清单 |
+| `runs.csv`、`agents.csv` | 各次运行、各 Agent 的指标和失败原因 |
+| `events.jsonl.gz` | 以纳秒为时间单位的事件、批次和内存账本 |
+| `comparisons.csv`、`report.md` | 按完成数和 goodput 选出的最佳固定分区、成对比较、归因和参数复核 |
+
+Goodput 的分母为首个到达到最后一个任务终态之间的时间。部分失败时结合完成数和成对完成样本一起解读。结果是当前假设下的仿真证据。真实设备的内存占用、批吞吐和恢复开销仍需独立校准。
+
+## 内存利用率可视化
+
+使用项目专用环境和独立的绘图依赖。下面两组用同一份 16 GiB、8 并发、seed 0 的工作负载做对照。
+
+```bash
+conda activate aws-py310
+python -m pip install -r requirements-viz.txt
+python -m sim run --config experiment_config.py --out results/memory-viz-run --quick
+python -m sim plot-memory --run results/memory-viz-run \
+  --case burst/n8/seed0/fixed90 --case burst/n8/seed0/shared \
+  --out results/memory-viz-minute
+```
+
+图中使用仿真分钟和 GiB。**物理驻留**为推理 KV 与工具当前占用的字节数，包含空闲或等待释放的状态。**正在执行**为当前 prefill、decode、reprefill 批次的驻留 KV，加上执行调用、读取 checkpoint 或恢复中的工具内存。磁盘排队期间，恢复内存只计入物理驻留。两条曲线的差值表示未参与当前执行的驻留量。
+
+每个点按各状态在该分钟内持续的仿真时间计算加权平均，最后不足一分钟按实际时长计算。右轴为同期平均执行占用除以平均驻留占用，驻留为零的窗口留空。水平虚线表示总 DRAM 扣除模型和系统静态保留量后的预算，标题中的平均利用率以该预算为分母。
+
+`memory_minute.csv` 保存图中的区间、均值和比例，`memory_timeline.csv` 保存计算前的事件时点与内存快照。CSV 使用纳秒和字节，执行占比以 0–1 表示。
+
+`--case` 可多次指定，case ID 见运行目录的 `runs.csv`。对旧运行（如 `results/v1`）加 `--resident-only` 可生成物理驻留曲线，其执行数据列为空。每次输出到新目录。
