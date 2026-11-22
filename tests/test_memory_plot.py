@@ -56,6 +56,7 @@ class TimelineTests(unittest.TestCase):
             (0, 10, 7), (2, 14, 6), (5, 14, 10), (7, 10, 4), (8, 8, 0), (10, 0, 0),
         ])
         self.assertAlmostEqual(timeline.mean_utilization(), 0.58)
+        self.assertAlmostEqual(timeline.mean_utilization(active=True), 0.28)
 
     def test_legacy_requires_resident_only_and_exports_missing_values(self):
         legacy = snapshot(0, 8, 2)
@@ -69,6 +70,7 @@ class TimelineTests(unittest.TestCase):
         timeline, = read_timelines(self.log, [CASE], resident_only=True)
         self.assertEqual(timeline.points[0].resident, 10)
         self.assertIsNone(timeline.points[0].executing)
+        self.assertIsNone(timeline.mean_utilization(active=True))
         self.assertIsNone(timeline.minute_averages()[0].executing_share)
         csv = self.log.with_name("timeline.csv")
         write_timeline_csv(csv, [timeline])
@@ -104,6 +106,7 @@ class TimelineTests(unittest.TestCase):
         self.write_log(header(), snapshot(0, event="drained"))
         timeline, = read_timelines(self.log, [CASE])
         self.assertIsNone(timeline.mean_utilization())
+        self.assertIsNone(timeline.mean_utilization(active=True))
         self.assertEqual(timeline.minute_averages(), [])
         self.write_log(header(), snapshot(0, 1, active_kv=2), snapshot(1, event="drained"))
         with self.assertRaisesRegex(ValueError, "inconsistent memory"):

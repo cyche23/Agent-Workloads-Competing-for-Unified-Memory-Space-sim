@@ -42,13 +42,13 @@ python -m pip install -r requirements-viz.txt
 python -m sim run --config experiment_config.py --out results/memory-viz-run --quick
 python -m sim plot-memory --run results/memory-viz-run \
   --case burst/n8/seed0/fixed90 --case burst/n8/seed0/shared \
-  --out results/memory-viz-minute
+  --out results/memory-viz-budget
 ```
 
 图中使用仿真分钟和 GiB。**物理驻留**为推理 KV 与工具当前占用的字节数，包含空闲或等待释放的状态。**正在执行**为当前 prefill、decode、reprefill 批次的驻留 KV，加上执行调用、读取 checkpoint 或恢复中的工具内存。磁盘排队期间，恢复内存只计入物理驻留。两条曲线的差值表示未参与当前执行的驻留量。
 
-每个点按各状态在该分钟内持续的仿真时间计算加权平均，最后不足一分钟按实际时长计算。右轴为同期平均执行占用除以平均驻留占用，驻留为零的窗口留空。水平虚线表示总 DRAM 扣除模型和系统静态保留量后的预算，标题中的平均利用率以该预算为分母。
+每个点按各状态在该分钟内持续的仿真时间计算加权平均，最后不足一分钟按实际时长计算。水平虚线表示总 DRAM 扣除模型和系统静态保留量后的预算。每个面板标题用同一预算作分母，分别给出全程时间加权的平均驻留占用（`mean resident / budget`）和平均执行占用（`mean active / budget`）。
 
-`memory_minute.csv` 保存图中的区间、均值和比例，`memory_timeline.csv` 保存计算前的事件时点与内存快照。CSV 使用纳秒和字节，执行占比以 0–1 表示。
+`memory_minute.csv` 保存图中的区间和均值，以及以 0–1 表示的每分钟执行占用与驻留占用之比。`memory_timeline.csv` 保存计算前的事件时点与内存快照。CSV 使用纳秒和字节。
 
 `--case` 可多次指定，case ID 见运行目录的 `runs.csv`。对旧运行（如 `results/v1`）加 `--resident-only` 可生成物理驻留曲线，其执行数据列为空。每次输出到新目录。
