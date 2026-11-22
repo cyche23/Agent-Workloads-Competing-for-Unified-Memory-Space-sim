@@ -31,6 +31,8 @@ def aggregate(rows: list[dict], agents: list[dict]) -> dict:
         "tool_restores", "checkpoint_read_s", "checkpoint_write_s",
         "kv_partition_blocked_requests", "tool_partition_blocked_requests",
         "gpu_wait_during_reprefill_s",
+        "fifo_head_wait_s", "fifo_tail_wait_s", "resident_bypass_admits",
+        "tool_request_kv_evictions", "kv_request_tool_evictions",
     )
     return {
         "submitted": len(agents),
@@ -49,6 +51,7 @@ def paired(fixed: list[dict], other: list[dict]) -> dict:
     fixed_ids = {(row["workload_id"], row["job_id"]): row for row in fixed}
     shared_ids = {(row["workload_id"], row["job_id"]): row for row in other}
     assert fixed_ids.keys() == shared_ids.keys()
+    fixed_e2e, other_e2e = [], []
     deltas = []
     saved_wait_s, saved_tokens, saved_restore_s = 0.0, 0, 0.0
     for key, baseline in fixed_ids.items():
@@ -59,6 +62,8 @@ def paired(fixed: list[dict], other: list[dict]) -> dict:
             if field.startswith("planned_"):
                 assert baseline[field] == candidate[field]
         if baseline["outcome"] == candidate["outcome"] == "completed":
+            fixed_e2e.append(baseline["e2e_s"])
+            other_e2e.append(candidate["e2e_s"])
             deltas.append(baseline["e2e_s"] - candidate["e2e_s"])
             saved_wait_s += (
                 baseline["kv_memory_wait_s"] + baseline["tool_memory_wait_s"]
@@ -70,6 +75,7 @@ def paired(fixed: list[dict], other: list[dict]) -> dict:
         "matched_completed": len(deltas),
         "matched_e2e_saved_p50_s": quantile(deltas, 0.5),
         "matched_e2e_saved_p95_s": quantile(deltas, 0.95),
+        "matched_p95_difference_s": quantile(fixed_e2e, 0.95) - quantile(other_e2e, 0.95) if deltas else None,
         "matched_memory_wait_saved_s": saved_wait_s if deltas else None,
         "matched_reprefill_tokens_saved": saved_tokens if deltas else None,
         "matched_tool_restore_saved_s": saved_restore_s if deltas else None,
@@ -151,12 +157,14 @@ def write_report(
         f"主场景使用 {config.profile.dram_gib:g} GiB DRAM，"
         f"其中 {config.profile.static_gib:g} GiB 预留给模型和系统。", "",
         "## 固定分区与共享池", "",
+        "共享池使用统一 FIFO 和全局 LRU。已驻留的可复用状态在新增占用有余量时可直接准入。"
+        "宽预算组使用同一准入次序。历史 v1 的共享池按两侧分别排队和回收。", "",
         "固定分区按完成数、goodput 依次择优。完成/提交按轨迹重放计数。Goodput 为每仿真分钟"
         "完成数，由各次试验完成数除以各次 makespan 之和。P95 使用各组的完成样本，"
-        "配对中位节省只使用双方均完成的同一 Agent，正值表示共享池延迟更低。", "",
+        "成对 P95 差在双方均完成的同一批 Agent 上计算，正值表示共享池尾延迟更低。", "",
         "| 场景 | 并发 | 固定推理份额 | 完成数 固定/共享/宽预算 | Goodput 固定/共享/宽预算 |"
-        " P95 秒 固定/共享/宽预算 | 共享池成对中位节省 秒 |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        " P95 秒 固定/共享/宽预算 | 共享池成对中位节省 秒 | 成对 P95 差 秒 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     arms = ("fixed", "shared", "relaxed")
     for row in comparisons:
@@ -165,11 +173,27 @@ def write_report(
         p95 = " / ".join(display(row[f"{arm}_e2e_p95_s"], 1) for arm in arms)
         paired_count = row["fixed_to_shared_matched_completed"]
         saved = display(row["fixed_to_shared_matched_e2e_saved_p50_s"], 1)
+        p95_saved = display(row["fixed_to_shared_matched_p95_difference_s"], 1)
         lines.append(
             f"| {row['scenario']} | {row['concurrency']} | {row['best_fixed_inference_percent']}% |"
             f" {complete}（共 {row['fixed_submitted']}） | {goodput} | {p95} | {saved}（n={paired_count}） |"
+            f" {p95_saved} |"
         )
 
+    lines.extend([
+        "", "## 共享池准入与驱逐", "",
+        "等待时间是所有申请的累计秒数。队尾等待从提交到首次成为队首或直接准入，"
+        "队首等待从首次成为队首到准入或失败。", "",
+        "| 场景 | 并发 | 队尾等待 秒 | 队首等待 秒 | 驻留命中直通 | 工具申请驱逐 KV | 推理申请驱逐工具 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ])
+    for row in comparisons:
+        lines.append(
+            f"| {row['scenario']} | {row['concurrency']} | "
+            f"{row['shared_fifo_tail_wait_s']:.1f} | {row['shared_fifo_head_wait_s']:.1f} | "
+            f"{row['shared_resident_bypass_admits']} | {row['shared_tool_request_kv_evictions']} | "
+            f"{row['shared_kv_request_tool_evictions']} |"
+        )
     lines.extend(["", "## 归因", ""])
     for scenario in ("burst", "staggered"):
         selected = [row for row in comparisons if row["scenario"] == scenario]

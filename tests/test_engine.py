@@ -105,11 +105,11 @@ class SimulatorTests(unittest.TestCase):
         self.assertEqual(fixed.jobs[1].terminal_at, ticks(1.2))
 
     def test_reprefill_is_exclusive_and_distinct_from_new_prefill(self):
-        a = Trace("evicted", (window(8, 0, 2), Round(8, 0, 5)), 1, 1)
+        a = Trace("evicted", (window(8, 0, 2), Round(6, 0, 5)), 1, 1)
         b = Trace("busy", (Round(1, 7),))
         c = Trace("arrives_during_reprefill", (Round(1, 0),))
         result = self.run_case(
-            profile(16), Policy("shared"), Arrival(1, a), Arrival(2, b, ticks(1)), Arrival(3, c, ticks(8.4)),
+            profile(16), Policy("shared"), Arrival(1, a), Arrival(2, b, ticks(1)), Arrival(3, c, ticks(3.4)),
         )
         start, = self.events("evict_start", side="kv")
         finish, = self.events("evict_finish", side="kv")
@@ -124,7 +124,7 @@ class SimulatorTests(unittest.TestCase):
         self.assertEqual(restored["at_ns"] - restore["at_ns"], ticks(0.5))
         batches = self.events("batch_start")
         self.assertFalse(any(restore["at_ns"] <= row["at_ns"] < restored["at_ns"] for row in batches))
-        self.assertEqual(result.jobs[0].counts["prefill_tokens"], 11)
+        self.assertEqual(result.jobs[0].counts["prefill_tokens"], 9)
         self.assertEqual(result.jobs[0].counts["reprefill_tokens"], 5)
         self.assertEqual(result.jobs[2].counts["gpu_wait_during_reprefill_ns"], ticks(0.4))
 
@@ -167,21 +167,104 @@ class SimulatorTests(unittest.TestCase):
         self.assertEqual(result.counters["checkpoint_disk_queue_ns"], ticks(0.3))
         self.assertEqual(self.events("tool_start", job_id=3)[0]["at_ns"], ticks(3.05))
 
-    def test_distinguishes_fixed_quota_true_hard_cap_and_no_progress(self):
+    def test_shared_can_reclaim_own_kv_for_tool_with_a_real_hard_cap(self):
         big = Trace("hard_cap", (Round(12, 0),))
         over = self.run_case(profile(10), Policy("shared"), Arrival(1, big))
         self.assertEqual(over.jobs[0].outcome, "kv_allocation_exceeds_cap")
-        immovable = Trace("no_progress", (window(6, 0, 1),), 5, 5)
-        deadlock = self.run_case(profile(10), Policy("shared"), Arrival(1, immovable))
-        self.assertEqual(deadlock.jobs[0].outcome, "tool_no_progress")
-        self.assertEqual(self.events("no_progress")[0]["target_bytes"], 5)
-        self.assertFalse(self.events("evict_start"))
-        separate = self.run_case(profile(12), Policy("fixed", 40), Arrival(1, immovable))
+        trace = Trace("tool_after_inference", (window(6, 0, 1),), 5, 5)
+        shared = self.run_case(profile(10), Policy("shared"), Arrival(1, trace))
+        self.assertEqual(shared.jobs[0].outcome, "completed")
+        evicted, = self.events("evict_finish", requester_side="tool", side="kv", job_id=1)
+        self.assertEqual(evicted["requester_id"], 1)
+        self.assertEqual(self.events("admit", side="tool")[0]["at_ns"], evicted["at_ns"])
+        self.assertEqual(shared.counters["tool_request_kv_evictions"], 1)
+        separate = self.run_case(profile(12), Policy("fixed", 40), Arrival(1, trace))
         self.assertEqual(separate.jobs[0].outcome, "kv_allocation_exceeds_cap")
         self.assertTrue(self.events("over_cap")[0]["partition_stranded"])
-        waived = self.run_case(profile(10), Policy("relaxed"), Arrival(1, immovable))
+        waived = self.run_case(profile(10), Policy("relaxed"), Arrival(1, trace))
         self.assertEqual(waived.jobs[0].outcome, "completed")
         self.assertGreater(waived.peaks["charged_bytes"], 10)
+
+    def test_global_lru_uses_both_sides_and_waits_for_physical_release(self):
+        a = Trace("idle_tool", (window(4, 0, 1), Round(0, 6)), 4, 4)
+        b = Trace("idle_kv", (window(3, 0, 3),), 1, 1)
+        c = Trace("needs_both", (Round(11, 0),))
+        result = self.run_case(
+            profile(18), Policy("shared"), Arrival(1, a), Arrival(2, b), Arrival(3, c, ticks(1.5)),
+        )
+        reclaim, = self.events("reclaim_start")
+        self.assertEqual(reclaim["victims"], [{"job_id": 2, "side": "kv"}, {"job_id": 1, "side": "tool"}])
+        releases = self.events("evict_finish", requester_side="kv")
+        self.assertEqual([row["at_ns"] for row in releases], [ticks(1.7), ticks(2.25)])
+        admitted, = self.events("admit", job_id=3)
+        self.assertEqual(admitted["at_ns"], releases[-1]["at_ns"])
+        self.assertEqual(admitted["request_order"], reclaim["request_order"])
+        self.assertEqual(result.counters["kv_request_tool_evictions"], 1)
+
+    def test_fifo_blocks_a_smaller_cold_request_behind_head(self):
+        anchor = Trace("anchor", (Round(0, 8),))
+        head = Trace("head", (Round(6, 0),))
+        tail = Trace("tail", (Round(2, 0),))
+        result = self.run_case(
+            profile(10), Policy("shared"), Arrival(1, anchor),
+            Arrival(2, head, ticks(1)), Arrival(3, tail, ticks(2)),
+        )
+        admitted = self.events("admit")
+        self.assertEqual([row["job_id"] for row in admitted], [1, 2, 3])
+        self.assertEqual(admitted[-1]["at_ns"], ticks(8))
+        self.assertEqual(result.jobs[2].counts["fifo_tail_wait_ns"], ticks(6))
+        self.assertFalse(self.events("evict_start"))
+
+    def test_resident_kv_bypasses_only_when_its_increment_fits(self):
+        anchor = Trace("anchor", (Round(0, 8),))
+        head = Trace("head", (Round(7, 0),))
+        for prompt, prefix, expect_bypass in ((5, 4, True), (6, 4, False), (5, 0, False)):
+            with self.subTest(prompt=prompt, prefix=prefix):
+                warm = Trace("warm_kv", (window(4, 0, 2), Round(prompt, 0, prefix)), 1, 1)
+                self.run_case(
+                    profile(14), Policy("shared"), Arrival(1, warm),
+                    Arrival(2, anchor), Arrival(3, head, ticks(1)),
+                )
+                admitted, = self.events("admit", job_id=1, side="kv", turn=2)
+                if expect_bypass:
+                    self.assertEqual(admitted["at_ns"], ticks(2.4))
+                    self.assertTrue(admitted["resident_bypass"])
+                    self.assertEqual(admitted["reservation_delta_bytes"], 1)
+                    self.assertIsNone(admitted["head_at_ns"])
+                else:
+                    self.assertGreater(admitted["at_ns"], ticks(2.4))
+                    self.assertFalse(self.events("admit", job_id=1, resident_bypass=True, at_ns=ticks(2.4)))
+
+    def test_resident_tool_bypasses_fifo_and_avoids_restore(self):
+        warm = Trace("warm_tool", (window(0, 0, 1), window(0, 1, 1)), 6, 7)
+        anchor = Trace("anchor", (Round(0, 8),))
+        head = Trace("head", (Round(10, 0),))
+        result = self.run_case(
+            profile(16), Policy("shared"), Arrival(1, warm),
+            Arrival(2, anchor), Arrival(3, head, ticks(1.2)),
+        )
+        admitted, = self.events("admit", job_id=1, side="tool", turn=2)
+        self.assertTrue(admitted["resident_bypass"])
+        self.assertEqual(admitted["at_ns"], ticks(2))
+        self.assertEqual(admitted["reservation_delta_bytes"], 1)
+        self.assertEqual(result.jobs[0].counts["tool_restores"], 0)
+
+    def test_resident_hit_cannot_spend_bytes_held_for_head(self):
+        victim = Trace("idle_tool", (window(0, 0, 0.1), Round(0, 4)), 3, 3)
+        warm = Trace("warm_kv", (window(4, 0, 2), Round(5, 0, 4)), 1, 1)
+        head = Trace("head", (Round(4, 0),))
+        self.run_case(
+            profile(13), Policy("shared"), Arrival(1, victim),
+            Arrival(2, warm), Arrival(3, head, ticks(2.2)),
+        )
+        reclaim, = self.events("reclaim_start", job_id=3)
+        self.assertEqual(reclaim["kv_held_bytes"], 1)
+        submitted, = self.events("submit", job_id=2, side="kv", turn=2)
+        admitted, = self.events("admit", job_id=2, side="kv", turn=2)
+        head_admit, = self.events("admit", job_id=3)
+        self.assertLess(reclaim["at_ns"], submitted["at_ns"])
+        self.assertLess(submitted["at_ns"], head_admit["at_ns"])
+        self.assertGreaterEqual(admitted["at_ns"], head_admit["at_ns"])
 
     def test_replay_is_deterministic(self):
         trace = Trace("same", (window(8, 1, 3), Round(7, 2, 6)), 1, 2)

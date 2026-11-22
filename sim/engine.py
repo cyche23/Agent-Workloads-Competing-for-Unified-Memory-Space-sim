@@ -11,6 +11,7 @@ from .config import Profile, TICKS_PER_SECOND, ticks
 from .trace import Round, Trace
 
 Side = Literal["kv", "tool"]
+Queue = Literal["kv", "tool", "global"]
 SIDES: tuple[Side, Side] = ("kv", "tool")
 
 
@@ -18,6 +19,10 @@ SIDES: tuple[Side, Side] = ("kv", "tool")
 class Policy:
     name: Literal["fixed", "shared", "relaxed"]
     inference_percent: int | None = None
+
+    @property
+    def global_queue(self) -> bool:
+        return self.name != "fixed"
 
     def caps(self, dynamic_bytes: int) -> dict[Side, int] | None:
         if self.name == "fixed":
@@ -69,11 +74,13 @@ class Job:
         return self.arrival.trace.rounds[self.turn]
 
 
-@dataclass
+@dataclass(eq=False)
 class Request:
     job: Job
     side: Side
     order: int
+    submitted_at: int
+    head_at: int | None = None
     last_block: tuple | None = None
     partition_blocked: bool = False
 
@@ -113,8 +120,9 @@ class Simulator:
         self.now = 0
         self.order = count()
         self.events: list[tuple[int, int, int, Callable, tuple]] = []
-        self.waiting: dict[Side, deque[Request]] = {side: deque() for side in SIDES}
-        self.reclaims: dict[Side, Reclaim] = {}
+        queues = ("global",) if policy.global_queue else SIDES
+        self.waiting: dict[Queue, deque[Request]] = {key: deque() for key in queues}
+        self.reclaims: dict[Queue, Reclaim] = {}
         self.resident: Counter = Counter()
         self.reserved: Counter = Counter()
         self.held: Counter = Counter()
@@ -140,6 +148,9 @@ class Simulator:
 
     def charged(self, side: Side) -> int:
         return self.resident[side] + self.reserved[side] + self.held[side]
+
+    def free_bytes(self) -> int:
+        return self.profile.capacity - sum(self.charged(side) for side in SIDES)
 
     def check_memory(self) -> None:
         for side in SIDES:
@@ -192,10 +203,14 @@ class Simulator:
         job.phase = phase
         job.phase_since = self.now
 
+    def queue_for(self, side: Side) -> Queue:
+        return "global" if self.policy.global_queue else side
+
     def submit(self, job: Job, side: Side) -> None:
         self.phase(job, f"{side}_memory_wait")
-        self.waiting[side].append(Request(job, side, next(self.order)))
-        self.record("submit", job, side=side)
+        request = Request(job, side, next(self.order), self.now)
+        self.waiting[self.queue_for(side)].append(request)
+        self.record("submit", job, side=side, request_order=request.order)
 
     def terminal(self, job: Job, outcome: str) -> None:
         self.phase(job, "")
@@ -217,10 +232,24 @@ class Simulator:
         return trace.tool_peak
 
     def admit(self) -> None:
-        # Independent FIFO queues. A blocked head on one side leaves the other eligible.
+        if self.policy.global_queue:
+            queue = self.waiting["global"]
+            while queue:
+                head = queue[0]
+                self.mark_head(head)
+                reclaim = self.reclaims.get("global")
+                # A settled transaction has already reserved enough for its head.
+                if reclaim is None or reclaim.remaining:
+                    if self.admit_resident_hit(queue):
+                        continue
+                if not self.try_admit(head):
+                    return
+            return
+
+        # Fixed partitions have independent queues and can make progress separately.
         while True:
             heads = sorted(
-                (self.waiting[side][0] for side in SIDES if self.waiting[side]),
+                (queue[0] for queue in self.waiting.values() if queue),
                 key=lambda request: request.order,
             )
             progressed = False
@@ -230,28 +259,61 @@ class Simulator:
             if not progressed:
                 return
 
+    def mark_head(self, request: Request) -> None:
+        if request.head_at is None:
+            request.head_at = self.now
+            self.record("queue_head", request.job, side=request.side, request_order=request.order)
+
+    def request_wait(self, request: Request) -> dict:
+        head_time = self.now if request.head_at is None else request.head_at
+        tail_wait, head_wait = head_time - request.submitted_at, self.now - head_time
+        if self.policy.global_queue:
+            request.job.counts["fifo_tail_wait_ns"] += tail_wait
+            request.job.counts["fifo_head_wait_ns"] += head_wait
+        return {"request_order": request.order, "head_at_ns": request.head_at,
+                "tail_wait_ns": tail_wait, "head_wait_ns": head_wait}
+
+    def prefix_tokens(self, job: Job) -> int:
+        return int(job.round.prefix * self.profile.prefix_fraction)
+
+    def admit_resident_hit(self, queue: deque[Request]) -> bool:
+        free = self.free_bytes()
+        for request in islice(queue, 1, None):
+            job, side = request.job, request.side
+            slot = job.slots[side]
+            if slot.state != "idle" or not slot.resident or (side == "kv" and not self.prefix_tokens(job)):
+                continue
+            target = self.target(request)
+            if self.policy.name == "relaxed" or target - slot.resident <= free:
+                # Existing reclaim holds are charged against free space.
+                self.start_request(request, target, bypass=True)
+                return True
+        return False
+
     def try_admit(self, request: Request) -> bool:
         job, side = request.job, request.side
+        key = self.queue_for(side)
+        self.mark_head(request)
         slot = job.slots[side]
-        if side in self.reclaims:
-            reclaim = self.reclaims[side]
+        if key in self.reclaims:
+            reclaim = self.reclaims[key]
             assert reclaim.request is request
             if reclaim.remaining:
                 return False
             assert reclaim.held == reclaim.needed
             self.held[side] -= reclaim.held
-            del self.reclaims[side]
+            del self.reclaims[key]
         target = self.target(request)
         if self.policy.name == "relaxed":
             self.start_request(request, target)
             return True
 
         cap = self.caps[side] if self.caps is not None else self.profile.capacity
-        total_free = self.profile.capacity - sum(self.charged(name) for name in SIDES)
+        total_free = self.free_bytes()
         side_free = cap - self.charged(side) if self.caps is not None else total_free
         needed = max(0, target - slot.resident)
         if target > cap:
-            self.waiting[side].popleft()
+            self.waiting[key].popleft()
             stranded = self.caps is not None and needed <= total_free
             if stranded:
                 job.counts[f"{side}_partition_blocked_requests"] += 1
@@ -261,7 +323,7 @@ class Simulator:
             self.record(
                 "over_cap", job, side=side, target_bytes=target, cap_bytes=cap,
                 needed_bytes=needed, side_free_bytes=side_free, total_free_bytes=total_free,
-                partition_stranded=stranded,
+                partition_stranded=stranded, **self.request_wait(request),
             )
             self.terminal(job, f"{side}_allocation_exceeds_cap")
             return True
@@ -284,44 +346,57 @@ class Simulator:
             self.record(
                 "memory_blocked", job, side=side, reason=block_kind,
                 needed_bytes=needed, side_free_bytes=side_free, total_free_bytes=total_free,
-                partition_stranded=stranded,
+                partition_stranded=stranded, request_order=request.order,
             )
         if slot.state == "evicting":
             return False
 
+        eligible_sides = SIDES if self.policy.global_queue else (side,)
+        # Sorting is stable, so equal per-agent timestamps use SIDES order.
         candidates = sorted(
-            (other for other in self.jobs if other is not job
-             and other.slots[side].state == "idle" and other.slots[side].resident),
-            key=lambda other: (other.slots[side].last_used, other.id),
+            ((other, victim_side) for other in self.jobs for victim_side in eligible_sides
+             if (other is not job or victim_side != side)
+             and other.slots[victim_side].state == "idle" and other.slots[victim_side].resident),
+            key=lambda candidate: (candidate[0].slots[candidate[1]].last_used, candidate[0].id),
         )
         selected = []
         recoverable = side_free
-        for victim in candidates:
-            selected.append(victim)
-            recoverable += victim.slots[side].resident
+        for victim, victim_side in candidates:
+            selected.append((victim, victim_side))
+            recoverable += victim.slots[victim_side].resident
             if recoverable >= needed:
                 break
         if recoverable < needed:
             return False
 
         reclaim = Reclaim(request, needed, len(selected), side_free)
-        self.reclaims[side] = reclaim
+        self.reclaims[key] = reclaim
         self.held[side] += reclaim.held
-        self.record("reclaim_start", job, side=side, victim_ids=[victim.id for victim in selected],
-                    needed_bytes=needed)
-        for victim in selected:
-            self.start_eviction(victim, side, reclaim)
+        self.record(
+            "reclaim_start", job, side=side, request_order=request.order, needed_bytes=needed,
+            victim_ids=[victim.id for victim, _ in selected],
+            victims=[{"job_id": victim.id, "side": victim_side} for victim, victim_side in selected],
+        )
+        for victim, victim_side in selected:
+            self.start_eviction(victim, victim_side, reclaim)
         return True
 
-    def start_request(self, request: Request, target: int) -> None:
+    def start_request(self, request: Request, target: int, *, bypass: bool = False) -> None:
         job, side = request.job, request.side
-        head = self.waiting[side].popleft()
-        assert head is request
+        queue = self.waiting[self.queue_for(side)]
+        if bypass:
+            assert queue[0] is not request
+            queue.remove(request)
+            job.counts["resident_bypass_admits"] += 1
+        else:
+            head = queue.popleft()
+            assert head is request
         slot = job.slots[side]
         old_state, old_resident = slot.state, slot.resident
         self.record(
             "admit", job, side=side, prior_state=old_state, target_bytes=target,
-            reservation_delta_bytes=target - old_resident,
+            reservation_delta_bytes=target - old_resident, resident_bypass=bypass,
+            **self.request_wait(request),
         )
         if side == "kv":
             self.start_inference(job, target, old_state, old_resident)
@@ -334,7 +409,8 @@ class Simulator:
         slot = job.slots[side]
         slot.state = "evicting"
         job.counts[f"{side}_evictions"] += 1
-        self.record("evict_start", job, side=side, bytes_to_free=slot.resident)
+        self.record("evict_start", job, side=side, bytes_to_free=slot.resident,
+                    requester_side=reclaim.request.side, request_order=reclaim.request.order)
         if side == "kv":
             self.after(ticks(self.profile.kv_evict_s), self.finish_eviction, job, side, reclaim, self.now)
         else:
@@ -353,11 +429,15 @@ class Simulator:
         hold = min(released, reclaim.needed - reclaim.held)
         reclaim.held += hold
         reclaim.remaining -= 1
-        self.held[side] += hold
+        requester_side = reclaim.request.side
+        self.held[requester_side] += hold
         self.counters[f"{side}_eviction_ns"] += self.now - started
+        if requester_side != side:
+            self.counters[f"{requester_side}_request_{side}_evictions"] += 1
         self.record(
             "evict_finish", job, side=side, released_bytes=released,
             duration_ns=self.now - started, requester_id=reclaim.request.job.id,
+            requester_side=requester_side, request_order=reclaim.request.order,
         )
 
     def disk(self, job: Job, direction: str, duration_s: float, after: Callable, *args) -> None:
@@ -406,7 +486,7 @@ class Simulator:
         self.advance(job)
 
     def start_inference(self, job: Job, target: int, old_state: str, old_resident: int) -> None:
-        prefix = int(job.round.prefix * self.profile.prefix_fraction)
+        prefix = self.prefix_tokens(job)
         reused = prefix if old_state == "idle" else 0
         job.reprefill_tokens = prefix if old_state == "evicted" else 0
         job.counts["reused_prompt_tokens"] += reused
@@ -544,7 +624,7 @@ class Simulator:
                 break
             self.now = self.events[0][0]
 
-        blocked = [request for side in SIDES for request in self.waiting[side]]
+        blocked = [request for queue in self.waiting.values() for request in queue]
         assert not self.reclaims and not (self.prefill or self.decode or self.reprefill or self.gpu_batch)
         assert {request.job.id for request in blocked} == {
             job.id for job in self.jobs if job.terminal_at is None
@@ -554,7 +634,8 @@ class Simulator:
             self.record(
                 "no_progress", request.job, side=request.side, target_bytes=self.target(request),
                 last_block=request.last_block,
-                queue_head_job_id=self.waiting[request.side][0].job.id,
+                queue_head_job_id=self.waiting[self.queue_for(request.side)][0].job.id,
+                **self.request_wait(request),
             )
         for request in blocked:
             self.terminal(request.job, f"{request.side}_no_progress")

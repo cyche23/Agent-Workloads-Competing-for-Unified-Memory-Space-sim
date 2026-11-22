@@ -23,8 +23,9 @@ PHASES = (
 JOB_COUNTS = (
     "rounds_executed", "tool_calls_executed", "prefill_tokens", "decode_tokens",
     "reused_prompt_tokens", "reprefill_tokens", "kv_evictions", "tool_evictions", "tool_restores",
-    "kv_partition_blocked_requests", "tool_partition_blocked_requests",
+    "kv_partition_blocked_requests", "tool_partition_blocked_requests", "resident_bypass_admits",
 )
+FIFO_TIMERS = ("fifo_tail_wait_ns", "fifo_head_wait_ns")
 RUN_TIMERS = (
     "prefill_gpu_ns", "decode_gpu_ns", "reprefill_gpu_ns", "kv_eviction_ns",
     "tool_eviction_ns", "checkpoint_read_ns", "checkpoint_write_ns",
@@ -32,8 +33,14 @@ RUN_TIMERS = (
 )
 RUN_COUNTS = (
     "prefill_batches", "decode_batches", "max_prefill_batch", "max_decode_batch",
-    "max_partition_shortfall_bytes",
+    "max_partition_shortfall_bytes", "tool_request_kv_evictions", "kv_request_tool_evictions",
 )
+POLICY_ADMISSION = {
+    "fixed": "per_side_fifo",
+    "shared": "global_fifo_with_resident_hits",
+    "relaxed": "global_fifo_with_resident_hits",
+}
+POLICY_EVICTION = {"fixed": "per_side_lru", "shared": "global_lru", "relaxed": "none"}
 
 
 def write_json(path: Path, data) -> None:
@@ -108,6 +115,10 @@ def measure_run(context: dict, result: RunResult) -> tuple[dict, list[dict]]:
             assert job.times["tool_execute"] == planned["planned_tool_ns"]
         assert job.terminal_at is not None
         assert job.counts["gpu_wait_during_reprefill_ns"] <= job.times["gpu_wait"]
+        if context.get("policy") in ("shared", "relaxed"):
+            assert sum(job.counts[field] for field in FIFO_TIMERS) == (
+                job.times["kv_memory_wait"] + job.times["tool_memory_wait"]
+            )
         jobs.append({
             **context,
             "job_id": job.id,
@@ -120,6 +131,7 @@ def measure_run(context: dict, result: RunResult) -> tuple[dict, list[dict]]:
             **planned,
             **{field: job.counts[field] for field in JOB_COUNTS},
             **{f"{field}_s": seconds(job.times[field]) for field in PHASES},
+            **{field.removesuffix("_ns") + "_s": seconds(job.counts[field]) for field in FIFO_TIMERS},
             "gpu_wait_during_reprefill_s": seconds(job.counts["gpu_wait_during_reprefill_ns"]),
         })
     makespan = seconds(max(row["terminal_ns"] for row in jobs) - min(row["arrival_ns"] for row in jobs))
@@ -140,6 +152,8 @@ def measure_run(context: dict, result: RunResult) -> tuple[dict, list[dict]]:
         **{field: sum(row[field] for row in jobs) for field in planned_work(result.jobs[0].arrival.trace)},
         **{field: sum(row[field] for row in jobs) for field in JOB_COUNTS},
         **{f"{field}_s": sum(row[f"{field}_s"] for row in jobs) for field in PHASES},
+        **{field: sum(row[field] for row in jobs)
+           for field in ("fifo_head_wait_s", "fifo_tail_wait_s")},
         "gpu_wait_during_reprefill_s": sum(row["gpu_wait_during_reprefill_s"] for row in jobs),
         **{field.removesuffix("_ns") + "_s": seconds(result.counters.get(field, 0)) for field in RUN_TIMERS},
         **{field: result.counters.get(field, 0) for field in RUN_COUNTS},
@@ -192,6 +206,8 @@ def execute(
                             "static_bytes": round(profile.static_gib * GIB),
                             "dynamic_limit_bytes": None if policy.name == "relaxed" else profile.capacity,
                             "side_limit_bytes": caps,
+                            "admission_policy": POLICY_ADMISSION[policy.name],
+                            "eviction_policy": POLICY_EVICTION[policy.name],
                         })
                         simulation = Simulator(profile, policy, arrivals, emit).run()
                         run, participants = measure_run(context, simulation)
@@ -212,13 +228,16 @@ def run_experiment(config: Experiment, config_file: Path, out: Path, quick: bool
             "source_sha256": source_hashes,
             "config_sha256": hashlib.sha256(config_file.read_bytes()).hexdigest(),
         })
-        write_json(out / "config.json", {"experiment": asdict(config), "quick": quick})
+        run_config = {
+            "experiment": asdict(config), "quick": quick,
+            "policies": {name: {"admission": admission, "eviction": POLICY_EVICTION[name]}
+                         for name, admission in POLICY_ADMISSION.items()},
+        }
+        write_json(out / "config.json", run_config)
         write_json(out / "traces.json", [asdict(trace) for trace in traces])
         runs, jobs, workloads, profiles = execute(config, traces, out, quick)
         write_json(out / "workloads.json", workloads)
-        write_json(out / "config.json", {
-            "experiment": asdict(config), "profiles_by_scenario": profiles, "quick": quick,
-        })
+        write_json(out / "config.json", {**run_config, "profiles_by_scenario": profiles})
         write_csv(out / "runs.csv", runs)
         write_csv(out / "agents.csv", jobs)
         comparisons = build_comparisons(runs, jobs)
