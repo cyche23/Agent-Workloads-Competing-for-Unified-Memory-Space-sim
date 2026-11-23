@@ -61,12 +61,12 @@ class Timeline:
     budget: int
     points: tuple[MemoryPoint, ...]
 
-    def mean_utilization(self) -> float | None:
+    def mean_utilization(self, *, active: bool = False) -> float | None:
         duration = self.points[-1].at_ns - self.points[0].at_ns
-        if not duration:
+        if not duration or (active and self.points[0].executing is None):
             return None
         byte_ns = sum(
-            point.resident * (following.at_ns - point.at_ns)
+            (point.executing if active else point.resident) * (following.at_ns - point.at_ns)
             for point, following in zip(self.points, self.points[1:])
         )
         return byte_ns / (duration * self.budget)
@@ -219,7 +219,6 @@ def plot_memory(run: Path, case_ids: list[str], out: Path, resident_only: bool =
     try:
         from matplotlib.backends.backend_agg import FigureCanvasAgg
         from matplotlib.figure import Figure
-        from matplotlib.ticker import PercentFormatter
     except ImportError as error:
         raise ValueError("install the plotting dependencies from requirements-viz.txt") from error
 
@@ -243,8 +242,6 @@ def plot_memory(run: Path, case_ids: list[str], out: Path, resident_only: bool =
     budget_label = "Dynamic budget"
     if len(budgets) == 1:
         budget_label += f" ({timelines[0].budget / GIB:g} GiB)"
-    ratio_line = None
-    ratio_color = "#007867"
     for axis, timeline, minutes in zip(axes, timelines, minute_series):
         time = [(minute.start_ns + minute.end_ns) / (2 * MINUTE_NS) for minute in minutes]
         resident = [minute.resident_bytes / GIB for minute in minutes]
@@ -254,21 +251,13 @@ def plot_memory(run: Path, case_ids: list[str], out: Path, resident_only: bool =
             executing = [minute.executing_bytes / GIB for minute in minutes]
             axis.fill_between(time, executing, resident, color="#d5e4ed", linewidth=0)
             axis.plot(time, executing, color="#af451e", linewidth=1.4, marker=marker, label="Executing")
-            ratios = [minute.executing_share for minute in minutes]
-            ratio_axis = axis.twinx()
-            ratio_line, = ratio_axis.plot(
-                time, ratios, color=ratio_color, linestyle=(0, (4, 3)), linewidth=1.2,
-                marker=marker, label="Executing / resident",
-            )
-            ratio_axis.set_ylim(0, 1)
-            ratio_axis.set_yticks((0, 0.25, 0.5, 0.75, 1))
-            ratio_axis.yaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=0))
-            ratio_axis.tick_params(axis="y", labelcolor=ratio_color)
-            ratio_axis.set_ylabel("Executing / resident", color=ratio_color)
         axis.axhline(timeline.budget / GIB, color="#6b7280", linestyle="--", linewidth=1,
                      label=budget_label)
         mean = timeline.mean_utilization()
         summary = "instantaneous run" if mean is None else f"mean resident / budget {mean:.1%}"
+        mean_active = timeline.mean_utilization(active=True)
+        if mean_active is not None:
+            summary += f"   |   mean active / budget {mean_active:.1%}"
         if len(budgets) > 1:
             summary += f" ({timeline.budget / GIB:g} GiB budget)"
         axis.set_title(f"{timeline.case_id}   |   {summary}", loc="left", fontsize=10)
@@ -276,9 +265,6 @@ def plot_memory(run: Path, case_ids: list[str], out: Path, resident_only: bool =
         axis.grid(axis="y", color="#e5e7eb")
         axis.set_axisbelow(True)
     handles, labels = axes[0].get_legend_handles_labels()
-    if ratio_line is not None:
-        handles.append(ratio_line)
-        labels.append(ratio_line.get_label())
     header.legend(handles, labels, loc="center", frameon=False, fontsize=9, ncols=len(handles))
     for axis in axes[:-1]:
         axis.tick_params(labelbottom=False)

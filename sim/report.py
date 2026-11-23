@@ -1,4 +1,4 @@
-"""Paired analysis of capacity pressure and fixed-partition losses."""
+"""Paired analysis of capacity pressure and same-budget policy gains."""
 
 import json
 from collections import Counter, defaultdict
@@ -7,6 +7,12 @@ from pathlib import Path
 
 from .config import Experiment, MIB
 from .trace import Trace
+
+ARMS = ("fixed", "shared", "oracle_fifo", "oracle", "relaxed")
+ORACLE_PAIRS = (
+    ("fixed", "oracle"), ("shared", "oracle_fifo"), ("oracle_fifo", "oracle"),
+    ("shared", "oracle"), ("oracle", "relaxed"),
+)
 
 
 def quantile(values: list[float], percentile: float) -> float | None:
@@ -28,9 +34,11 @@ def aggregate(rows: list[dict], agents: list[dict]) -> dict:
     sums = (
         "kv_memory_wait_s", "tool_memory_wait_s", "gpu_wait_s", "kv_evictions",
         "tool_evictions", "reprefill_tokens", "reprefill_gpu_s", "tool_restore_s",
-        "tool_restores", "checkpoint_read_s", "checkpoint_write_s",
+        "tool_restores", "checkpoint_read_s", "checkpoint_write_s", "checkpoint_disk_queue_s",
         "kv_partition_blocked_requests", "tool_partition_blocked_requests",
         "gpu_wait_during_reprefill_s",
+        "fifo_head_wait_s", "fifo_tail_wait_s", "resident_bypass_admits", "oracle_bypass_admits",
+        "tool_request_kv_evictions", "kv_request_tool_evictions",
     )
     return {
         "submitted": len(agents),
@@ -45,20 +53,23 @@ def aggregate(rows: list[dict], agents: list[dict]) -> dict:
     }
 
 
-def paired(fixed: list[dict], other: list[dict]) -> dict:
-    fixed_ids = {(row["workload_id"], row["job_id"]): row for row in fixed}
-    shared_ids = {(row["workload_id"], row["job_id"]): row for row in other}
-    assert fixed_ids.keys() == shared_ids.keys()
+def paired(baseline_rows: list[dict], candidate_rows: list[dict]) -> dict:
+    baseline_ids = {(row["workload_id"], row["job_id"]): row for row in baseline_rows}
+    candidate_ids = {(row["workload_id"], row["job_id"]): row for row in candidate_rows}
+    assert baseline_ids.keys() == candidate_ids.keys()
+    baseline_e2e, candidate_e2e = [], []
     deltas = []
     saved_wait_s, saved_tokens, saved_restore_s = 0.0, 0, 0.0
-    for key, baseline in fixed_ids.items():
-        candidate = shared_ids[key]
+    for key, baseline in baseline_ids.items():
+        candidate = candidate_ids[key]
         assert baseline["instance"] == candidate["instance"]
         assert baseline["arrival_ns"] == candidate["arrival_ns"]
         for field in baseline:
             if field.startswith("planned_"):
                 assert baseline[field] == candidate[field]
         if baseline["outcome"] == candidate["outcome"] == "completed":
+            baseline_e2e.append(baseline["e2e_s"])
+            candidate_e2e.append(candidate["e2e_s"])
             deltas.append(baseline["e2e_s"] - candidate["e2e_s"])
             saved_wait_s += (
                 baseline["kv_memory_wait_s"] + baseline["tool_memory_wait_s"]
@@ -68,8 +79,10 @@ def paired(fixed: list[dict], other: list[dict]) -> dict:
             saved_restore_s += baseline["tool_restore_s"] - candidate["tool_restore_s"]
     return {
         "matched_completed": len(deltas),
+        "matched_e2e_saved_sum_s": sum(deltas) if deltas else None,
         "matched_e2e_saved_p50_s": quantile(deltas, 0.5),
         "matched_e2e_saved_p95_s": quantile(deltas, 0.95),
+        "matched_p95_difference_s": quantile(baseline_e2e, 0.95) - quantile(candidate_e2e, 0.95) if deltas else None,
         "matched_memory_wait_saved_s": saved_wait_s if deltas else None,
         "matched_reprefill_tokens_saved": saved_tokens if deltas else None,
         "matched_tool_restore_saved_s": saved_restore_s if deltas else None,
@@ -97,17 +110,16 @@ def build_comparisons(runs: list[dict], agents: list[dict]) -> list[dict]:
                 -key[1],
             ),
         )
-        shared, relaxed = ("shared", None), ("relaxed", None)
-        fixed_shared = paired(cohorts[best], cohorts[shared])
-        shared_relaxed = paired(cohorts[shared], cohorts[relaxed])
+        arm_keys = {name: (name, None) for name in ARMS}
+        arm_keys["fixed"] = best
+        pairs = (("fixed", "shared"), ("shared", "relaxed"), *ORACLE_PAIRS)
         comparisons.append({
             "scenario": scenario, "concurrency": concurrency, "seed_count": len(arms[best]),
             "best_fixed_inference_percent": best[1],
-            **{f"{arm}_{field}": value for arm, key in
-               (("fixed", best), ("shared", shared), ("relaxed", relaxed))
-               for field, value in metrics[key].items()},
-            **{f"fixed_to_shared_{field}": value for field, value in fixed_shared.items()},
-            **{f"shared_to_relaxed_{field}": value for field, value in shared_relaxed.items()},
+            **{f"{arm}_{field}": value for arm, key in arm_keys.items() for field, value in metrics[key].items()},
+            **{f"{baseline}_to_{candidate}_{field}": value
+               for baseline, candidate in pairs
+               for field, value in paired(cohorts[arm_keys[baseline]], cohorts[arm_keys[candidate]]).items()},
         })
     return comparisons
 
@@ -150,26 +162,80 @@ def write_report(
         f"共完成 {cases} 组仿真。运行模式为{'快速检查' if quick else '完整实验矩阵'}。"
         f"主场景使用 {config.profile.dram_gib:g} GiB DRAM，"
         f"其中 {config.profile.static_gib:g} GiB 预留给模型和系统。", "",
-        "## 固定分区与共享池", "",
+        "## 完成数、吞吐与延迟", "",
+        "共享池使用统一 FIFO 和全局 LRU。已驻留的可复用状态在新增占用有余量时可直接准入。"
+        "宽预算组使用同一准入次序。历史 v1 的共享池按两侧分别排队和回收。", "",
+        f"两个 oracle 组使用同一 DRAM 上限和 {config.oracle_window_s:g} 秒预演窗。"
+        "`oracle_fifo` 保留共享池准入规则，`oracle` 同时评估队尾请求。"
+        "决策优先避免任务失败，再降低累计端到端时间的预测值。实测结果给出这些可行策略"
+        "在当前模型中已达到的性能，宽预算组用于诊断容量放宽后的表现。", "",
         "固定分区按完成数、goodput 依次择优。完成/提交按轨迹重放计数。Goodput 为每仿真分钟"
         "完成数，由各次试验完成数除以各次 makespan 之和。P95 使用各组的完成样本，"
-        "配对中位节省只使用双方均完成的同一 Agent，正值表示共享池延迟更低。", "",
-        "| 场景 | 并发 | 固定推理份额 | 完成数 固定/共享/宽预算 | Goodput 固定/共享/宽预算 |"
-        " P95 秒 固定/共享/宽预算 | 共享池成对中位节省 秒 |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "下表各指标依次列出 fixed、shared、oracle_fifo、oracle、relaxed。", "",
+        "| 场景 | 并发 | 固定推理份额 | 完成数 | Goodput | P95 秒 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
     ]
-    arms = ("fixed", "shared", "relaxed")
     for row in comparisons:
-        complete = " / ".join(str(row[f"{arm}_completed"]) for arm in arms)
-        goodput = " / ".join(display(row[f"{arm}_goodput_per_min"]) for arm in arms)
-        p95 = " / ".join(display(row[f"{arm}_e2e_p95_s"], 1) for arm in arms)
-        paired_count = row["fixed_to_shared_matched_completed"]
-        saved = display(row["fixed_to_shared_matched_e2e_saved_p50_s"], 1)
+        complete = " / ".join(str(row[f"{arm}_completed"]) for arm in ARMS)
+        goodput = " / ".join(display(row[f"{arm}_goodput_per_min"]) for arm in ARMS)
+        p95 = " / ".join(display(row[f"{arm}_e2e_p95_s"], 1) for arm in ARMS)
         lines.append(
             f"| {row['scenario']} | {row['concurrency']} | {row['best_fixed_inference_percent']}% |"
-            f" {complete}（共 {row['fixed_submitted']}） | {goodput} | {p95} | {saved}（n={paired_count}） |"
+            f" {complete}（各提交 {row['fixed_submitted']}） | {goodput} | {p95} |"
         )
 
+    failures = []
+    for row in comparisons:
+        for arm in ARMS:
+            reasons = json.loads(row[f"{arm}_failure_reasons"])
+            if reasons:
+                detail = "，".join(f"`{reason}` × {count}" for reason, count in reasons.items())
+                failures.append(f"| {row['scenario']} | {row['concurrency']} | {arm} | {detail} |")
+    if failures:
+        lines.extend([
+            "", "| 场景 | 并发 | 策略 | 失败原因与次数 |", "| --- | ---: | --- | --- |", *failures,
+        ])
+
+    lines.extend([
+        "", "## Oracle 配对对照", "",
+        "各项节省按左侧策略减去右侧策略计算。任务延迟、内存等待、重算和工具恢复使用双方均完成的同一批任务。"
+        "配对 P95 差使用这批任务分别计算两组的 P95。磁盘等待为各组所有 I/O 的累计排队时间。", "",
+        "| 场景 | 并发 | 对照 | 完成数变化 | 成对完成 | 累计延迟节省 秒 | 中位节省 秒 | P95 差 秒 |"
+        " 内存等待节省 秒 | 重算节省 tokens | 工具恢复节省 秒 | 磁盘排队节省 秒 |",
+        "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ])
+    for row in comparisons:
+        for baseline, candidate in ORACLE_PAIRS:
+            prefix = f"{baseline}_to_{candidate}_"
+            delta = row[f"{candidate}_completed"] - row[f"{baseline}_completed"]
+            disk = row[f"{baseline}_checkpoint_disk_queue_s"] - row[f"{candidate}_checkpoint_disk_queue_s"]
+            lines.append(
+                f"| {row['scenario']} | {row['concurrency']} | {baseline} → {candidate} | {delta:+d} |"
+                f" {row[prefix + 'matched_completed']} |"
+                f" {display(row[prefix + 'matched_e2e_saved_sum_s'], 1)} |"
+                f" {display(row[prefix + 'matched_e2e_saved_p50_s'], 1)} |"
+                f" {display(row[prefix + 'matched_p95_difference_s'], 1)} |"
+                f" {display(row[prefix + 'matched_memory_wait_saved_s'], 1)} |"
+                f" {display(row[prefix + 'matched_reprefill_tokens_saved'], 0)} |"
+                f" {display(row[prefix + 'matched_tool_restore_saved_s'], 1)} | {disk:.1f} |"
+            )
+
+    lines.extend([
+        "", "## 共享池准入与驱逐", "",
+        "等待时间是所有申请的累计秒数。队尾等待从提交到首次成为队首或直接准入，"
+        "队首等待从首次成为队首到准入或失败。", "",
+        "| 场景 | 并发 | 策略 | 队尾等待 秒 | 队首等待 秒 | 驻留命中直通 | Oracle 越序 |"
+        " 工具申请驱逐 KV | 推理申请驱逐工具 |",
+        "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ])
+    for row in comparisons:
+        for arm in ("shared", "oracle_fifo", "oracle"):
+            lines.append(
+                f"| {row['scenario']} | {row['concurrency']} | {arm} |"
+                f" {row[f'{arm}_fifo_tail_wait_s']:.1f} | {row[f'{arm}_fifo_head_wait_s']:.1f} |"
+                f" {row[f'{arm}_resident_bypass_admits']} | {row[f'{arm}_oracle_bypass_admits']} |"
+                f" {row[f'{arm}_tool_request_kv_evictions']} | {row[f'{arm}_kv_request_tool_evictions']} |"
+            )
     lines.extend(["", "## 归因", ""])
     for scenario in ("burst", "staggered"):
         selected = [row for row in comparisons if row["scenario"] == scenario]
