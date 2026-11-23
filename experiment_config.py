@@ -18,8 +18,8 @@ CONFIG = Experiment(
     ),
     profile=Profile(
         dram_gib=32,
-        static_gib=16,
-        kv_bytes_per_token=109 * 1024,
+        static_gib=16,  # 按照1.7B模型运行在32GB设备上考虑
+        kv_bytes_per_token=109 * 1024,  
         # Aggregate token/s indexed by batch size 1 through 8. Only size 1
         # is anchored to the historical Jetson replay.
         prefill_tps=(6000, 6375, 6750, 6750, 6750, 6750, 6750, 6750),

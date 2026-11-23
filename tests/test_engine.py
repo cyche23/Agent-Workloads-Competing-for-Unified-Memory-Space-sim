@@ -266,14 +266,102 @@ class SimulatorTests(unittest.TestCase):
         self.assertLess(submitted["at_ns"], head_admit["at_ns"])
         self.assertGreaterEqual(admitted["at_ns"], head_admit["at_ns"])
 
+    def test_oracle_waits_for_a_near_release_and_reclaims_for_a_long_wait(self):
+        requester = Trace("requester", (window(3, 0, 1), Round(4, 1, 3)), 5, 5)
+        anchor = Trace("anchor", (Round(0, 5),))
+        for name in ("oracle_fifo", "oracle"):
+            policy = Policy(name)
+            with self.subTest(policy=name, release="near"):
+                config = profile(10, decode_tps=(10, 20))
+                arrivals = (Arrival(1, requester, ticks(0.4)), Arrival(2, anchor))
+                baseline = self.run_case(config, Policy("shared"), *arrivals)
+                result = self.run_case(config, policy, *arrivals)
+                decision, = self.events("oracle_decision")
+                self.assertEqual(decision["at_ns"], ticks(0.7))
+                self.assertEqual(decision["candidates"][decision["selected"]]["action"], "wait")
+                self.assertFalse(self.events("evict_start"))
+                self.assertEqual(result.jobs[0].terminal_at, ticks(2))
+                self.assertEqual(baseline.jobs[0].terminal_at - result.jobs[0].terminal_at, ticks(0.4))
+            with self.subTest(policy=name, release="far"):
+                result = self.run_case(profile(10), policy, Arrival(1, requester), Arrival(2, anchor))
+                first = self.events("oracle_decision")[0]
+                candidate = first["candidates"][first["selected"]]
+                self.assertEqual(candidate["action"], "reclaim")
+                self.assertEqual([(v["job_id"], v["side"]) for v in candidate["victims"]], [(1, "kv")])
+                self.assertEqual(result.jobs[0].counts["reprefill_tokens"], 3)
+
+    def test_oracle_selects_between_kv_and_tool_as_restore_cost_changes(self):
+        tool = Trace("idle_tool", (window(4, 0, 1), window(0, 6, 1)), 4, 4)
+        kv = Trace("idle_kv", (window(3, 0, 4), Round(3, 0, 3)), 1, 1)
+        arrivals = (Arrival(1, tool), Arrival(2, kv), Arrival(3, Trace("new", (Round(7, 0),)), ticks(1.5)))
+        for restore_s, expected in ((0, (1, "tool")), (4, (2, "kv"))):
+            with self.subTest(restore_s=restore_s):
+                config = profile(18, tool_save_s=0.05, tool_write_s=0.05, tool_release_s=0.05,
+                                 tool_read_s=0, tool_restore_s=restore_s)
+                result = self.run_case(config, Policy("oracle_fifo"), *arrivals)
+                decision = self.events("oracle_decision")[0]
+                choices = decision["candidates"]
+                self.assertEqual({c["victims"][0]["side"] for c in choices if c["victims"]}, {"kv", "tool"})
+                chosen, = choices[decision["selected"]]["victims"]
+                self.assertEqual((chosen["job_id"], chosen["side"]), expected)
+                eviction, = self.events("evict_start")
+                self.assertEqual((eviction["job_id"], eviction["side"]), expected)
+                self.assertTrue(all(job.outcome == "completed" for job in result.jobs))
+
+    def test_oracle_scores_an_unavoidable_restore_over_cap_beyond_its_window(self):
+        tool = Trace("idle_tool", (window(4, 0, 1), window(0, 6, 1)), 4, 4)
+        kv = Trace("idle_kv", (window(3, 0, 4), Round(3, 0, 3)), 1, 1)
+        arrivals = (Arrival(1, tool), Arrival(2, kv), Arrival(3, Trace("new", (Round(7, 0),)), ticks(1.5)))
+        config = profile(18, tool_restore_peak_mib=19 / MIB, tool_save_s=0.05,
+                         tool_write_s=0.05, tool_release_s=0.05, tool_read_s=0, tool_restore_s=0)
+        result = self.run_case(config, Policy("oracle_fifo", oracle_window_s=0.1), *arrivals)
+        decision = self.events("oracle_decision")[0]
+        unsafe, = [c for c in decision["candidates"] if c["victims"] and c["victims"][0]["side"] == "tool"]
+        self.assertEqual(unsafe["failures"], 1)
+        self.assertEqual(decision["candidates"][decision["selected"]]["failures"], 0)
+        self.assertTrue(all(job.outcome == "completed" for job in result.jobs))
+
+    def test_oracle_cold_tail_can_reclaim_and_owns_the_released_bytes(self):
+        anchor = Trace("anchor", (window(0, 0, 0.1), Round(0, 8)), 3, 3)
+        head = Trace("head", (Round(7, 0),))
+        tail = Trace("tail", (Round(4, 0),))
+        arrivals = (Arrival(1, anchor), Arrival(2, head, ticks(1)), Arrival(3, tail, ticks(2)))
+        fifo = self.run_case(profile(13), Policy("oracle_fifo"), *arrivals)
+        result = self.run_case(profile(13), Policy("oracle"), *arrivals)
+        reclaim, = self.events("reclaim_start", job_id=3)
+        released, = self.events("evict_finish", requester_id=3)
+        admitted, = self.events("admit", job_id=3)
+        self.assertEqual(reclaim["kv_held_bytes"], 2)
+        self.assertEqual(released["kv_held_bytes"], 4)
+        self.assertEqual(admitted["at_ns"], released["at_ns"])
+        self.assertEqual(admitted["request_order"], reclaim["request_order"])
+        self.assertEqual(admitted["prior_state"], "cold")
+        self.assertTrue(admitted["oracle_bypass"])
+        self.assertFalse(admitted["resident_bypass"])
+        self.assertIsNone(admitted["head_at_ns"])
+        self.assertLess(admitted["at_ns"], self.events("admit", job_id=2)[0]["at_ns"])
+        self.assertLess(sum(job.terminal_at for job in result.jobs), sum(job.terminal_at for job in fifo.jobs))
+
+    def test_oracle_forces_reclaim_with_no_independent_progress_and_zero_release_time(self):
+        trace = Trace("own_kv", (window(6, 0, 1),), 5, 5)
+        result = self.run_case(profile(10, kv_evict_s=0), Policy("oracle"), Arrival(1, trace))
+        decision, = self.events("oracle_decision")
+        self.assertEqual([c["action"] for c in decision["candidates"]], ["reclaim"])
+        released, = self.events("evict_finish")
+        admitted, = self.events("admit", side="tool")
+        self.assertEqual(released["at_ns"], admitted["at_ns"])
+        self.assertEqual(result.jobs[0].outcome, "completed")
+
     def test_replay_is_deterministic(self):
         trace = Trace("same", (window(8, 1, 3), Round(7, 2, 6)), 1, 2)
         arrivals = (Arrival(2, trace, ticks(0.25)), Arrival(1, trace))
-        first = self.run_case(profile(17), Policy("shared"), *arrivals)
-        log = self.log
-        second = self.run_case(profile(17), Policy("shared"), *arrivals)
-        self.assertEqual(self.log, log)
-        self.assertEqual(first, second)
+        for name in ("shared", "oracle_fifo", "oracle"):
+            with self.subTest(policy=name):
+                first = self.run_case(profile(17), Policy(name), *arrivals)
+                log = self.log
+                second = self.run_case(profile(17), Policy(name), *arrivals)
+                self.assertEqual(self.log, log)
+                self.assertEqual(first, second)
 
 
 if __name__ == "__main__":

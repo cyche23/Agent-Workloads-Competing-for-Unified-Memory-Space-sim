@@ -1,6 +1,6 @@
 # 统一内存 Agent workload 仿真
 
-用 SWE-bench/OpenHands 多轮轨迹重放单台统一内存设备上的本地推理与工具执行。比较固定分区、同预算共享池和宽预算诊断组，衡量高负载下的内存排队、KV 重算、工具恢复与端到端完成表现。
+用 SWE-bench/OpenHands 多轮轨迹重放单台统一内存设备上的本地推理与工具执行。比较固定分区、同预算共享池、两个同预算 oracle 和宽预算诊断组，衡量内存排队、KV 重算、工具恢复与端到端表现。
 
 ## 运行
 
@@ -15,7 +15,7 @@ sim_run_dir="results/sim-$(date +%Y%m%d-%H%M%S)"
 python -m sim run --config experiment_config.py --out "$sim_run_dir" --quick
 ```
 
-每次运行指定一个新目录。加上 `--quick` 可用第一个 seed 检查主配置的最低与最高并发。全量运行每进入一个场景会打印进度，`status.json` 记录执行状态。
+每次运行指定一个新目录。加上 `--quick` 时，使用第一个 seed 运行 `concurrency` 中所有并发度的 `burst` 场景，跳过 `staggered` 和敏感性分析。每进入一个场景会打印进度，`status.json` 记录执行状态。
 
 ## 数据与内存账本
 
@@ -25,15 +25,22 @@ python -m sim run --config experiment_config.py --out "$sim_run_dir" --quick
 - 固定分区在扣除静态保留后限制每侧额度，两侧各用自己的 FIFO 和本侧 LRU。共享池把推理与工具申请放进统一 FIFO。队首容量不足时，全局 LRU 可以驱逐任意空闲 KV 或工具环境，实际释放后再准入。宽预算组使用相同的准入次序。
 - 共享池和宽预算组都允许驻留命中的请求直接准入。所需 KV 前缀或工具环境仍在内存时，只要本轮新增用量能放入未预留的额度，请求就可以提前通过。冷请求、需要恢复的请求和无法直接容纳的请求按 FIFO 等待。实际申请超限和队列无法继续推进分别记账。
 
+## 同预算 Oracle
+
+- `oracle_fifo` 沿用共享池的 FIFO 和驻留命中直通，在队首遇到内存阻塞时比较等待自然释放与跨侧驱逐。`oracle` 同时比较让其他已提交请求先准入的收益，包括冷请求和需要恢复的请求。参与重排的候选取 FIFO 前八个，以及共享池本来会直通的请求。
+- 每个回收候选从两侧空闲状态里选出足以覆盖缺口的一组。选取顺序分别使用 LRU、预计释放时间、单位释放字节的释放与恢复代价。队尾请求发起回收时，释放的额度保留给该请求，直到事务完成。
+- 每种动作从当前状态独立预演一次，随后按共享池规则继续。窗口默认 30 秒，可在实验配置中设置 `oracle_window_s`。预演可读取窗口内的未来到达和轨迹，遵守 DRAM、GPU 和磁盘账本。评分先比较预测失败数，再比较累计未完成时间加剩余服务时间估计。后者包括窗口末的 KV 重算和工具恢复负担。每次只执行代价最低的动作，同分优先选择共享池的动作。
+- `shared → oracle_fifo` 衡量等待与驱逐的收益，`oracle_fifo → oracle` 衡量加入准入调度的净收益。结果给出当前模型下已实现的同预算改善幅度，全局最优改善幅度仍未知。宽预算组提供容量放宽后的诊断参考。
+
 ## 结果
 
 | 文件 | 内容 |
 | --- | --- |
 | `config.json`、`sources.json` | 生效参数、场景配置、配置与 trace 源文件的 SHA-256 |
 | `traces.json`、`workloads.json` | 归一化 trace 与各对照组共用的到达清单 |
-| `runs.csv`、`agents.csv` | 运行和 Agent 指标、失败原因、队首和队尾等待、驻留命中准入 |
-| `events.jsonl.gz` | 以纳秒为时间单位的事件、批次和内存账本，包含跨侧驱逐和 FIFO 申请序号 |
-| `comparisons.csv`、`report.md` | 按完成数和 goodput 选出的最佳固定分区、成对比较、归因和参数复核 |
+| `runs.csv`、`agents.csv` | 逐 seed 的运行和 Agent 指标、失败原因、队首和队尾等待、驻留命中直通和 oracle 越序准入 |
+| `events.jsonl.gz` | 纳秒粒度的事件、内存账本、跨侧驱逐，以及 oracle 候选、预测代价和最终选择 |
+| `comparisons.csv`、`report.md` | 最佳固定分区、累计配对延迟节省、尾延迟、吞吐和开销归因 |
 
 Goodput 的分母为首个到达到最后一个任务终态之间的时间。部分失败时结合完成数和成对完成样本一起解读。结果是当前假设下的仿真证据。真实设备的内存占用、批吞吐和恢复开销仍需独立校准。
 
@@ -54,6 +61,19 @@ python -m sim plot-memory \
   --case burst/n8/seed0/fixed90 \
   --case burst/n8/seed0/shared \
   --out "${sim_run_dir}-memory"
+
+python -m sim plot-memory \
+  --run "results/sim-20261123-120246" \
+  --case burst/n8/seed0/fixed90 \
+  --case burst/n8/seed0/shared \
+  --case burst/n8/seed0/relaxed \
+  --case burst/n6/seed0/fixed90 \
+  --case burst/n6/seed0/shared \
+  --case burst/n6/seed0/relaxed \
+  --case burst/n3/seed0/fixed90 \
+  --case burst/n3/seed0/shared \
+  --case burst/n3/seed0/relaxed \
+  --out "results/sim-20261123-120246-memory"
 ```
 
 图中使用仿真分钟和 GiB。**物理驻留**为推理 KV 与工具当前占用的字节数，包含空闲或等待释放的状态。**正在执行**为当前 prefill、decode、reprefill 批次的驻留 KV，加上执行调用、读取 checkpoint 或恢复中的工具内存。磁盘排队期间，恢复内存只计入物理驻留。两条曲线的差值表示未参与当前执行的驻留量。

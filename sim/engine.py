@@ -7,7 +7,7 @@ from itertools import chain, count, islice
 from math import ceil
 from typing import Callable, Literal
 
-from .config import Profile, TICKS_PER_SECOND, ticks
+from .config import DEFAULT_ORACLE_WINDOW_S, Profile, TICKS_PER_SECOND, oracle_window_ticks, ticks
 from .trace import Round, Trace
 
 Side = Literal["kv", "tool"]
@@ -17,12 +17,17 @@ SIDES: tuple[Side, Side] = ("kv", "tool")
 
 @dataclass(frozen=True)
 class Policy:
-    name: Literal["fixed", "shared", "relaxed"]
+    name: Literal["fixed", "shared", "relaxed", "oracle_fifo", "oracle"]
     inference_percent: int | None = None
+    oracle_window_s: float = DEFAULT_ORACLE_WINDOW_S
 
     @property
     def global_queue(self) -> bool:
         return self.name != "fixed"
+
+    @property
+    def uses_oracle(self) -> bool:
+        return self.name in ("oracle_fifo", "oracle")
 
     def caps(self, dynamic_bytes: int) -> dict[Side, int] | None:
         if self.name == "fixed":
@@ -30,8 +35,10 @@ class Policy:
                 raise ValueError("fixed policy requires an inference percentage in (0, 100)")
             kv = dynamic_bytes * self.inference_percent // 100
             return {"kv": kv, "tool": dynamic_bytes - kv}
-        if self.name not in ("shared", "relaxed") or self.inference_percent is not None:
-            raise ValueError("invalid shared or relaxed policy")
+        if self.name not in ("shared", "relaxed", "oracle_fifo", "oracle") or self.inference_percent is not None:
+            raise ValueError("invalid policy or inference percentage")
+        if self.uses_oracle:
+            oracle_window_ticks(self.oracle_window_s)
         return None
 
 
@@ -91,6 +98,7 @@ class Reclaim:
     needed: int
     remaining: int
     held: int
+    oracle_bypass: bool = False
 
 
 @dataclass(frozen=True)
@@ -136,6 +144,11 @@ class Simulator:
         self.reprefill_until = 0
         self.last_batch = "decode"
         self.disk_free_at = 0
+        self.oracle = None
+        if policy.uses_oracle:
+            from .oracle import Oracle
+
+            self.oracle = Oracle(profile, policy, arrivals)
         for job in sorted(self.jobs, key=lambda job: job.id):
             self.schedule(job.arrival.at_ns, self.submit, job, "kv", priority=1)
 
@@ -232,16 +245,23 @@ class Simulator:
         return trace.tool_peak
 
     def admit(self) -> None:
+        if self.oracle is not None:
+            self.oracle.admit(self)
+            return
         if self.policy.global_queue:
             queue = self.waiting["global"]
             while queue:
                 head = queue[0]
                 self.mark_head(head)
                 reclaim = self.reclaims.get("global")
-                # A settled transaction has already reserved enough for its head.
-                if reclaim is None or reclaim.remaining:
-                    if self.admit_resident_hit(queue):
+                if reclaim is not None:
+                    if self.advance_reclaim(queue, reclaim):
                         continue
+                    return
+                hit = self.resident_hit(queue)
+                if hit is not None:
+                    self.start_request(hit, self.target(hit), bypass=True)
+                    continue
                 if not self.try_admit(head):
                     return
             return
@@ -276,9 +296,11 @@ class Simulator:
     def prefix_tokens(self, job: Job) -> int:
         return int(job.round.prefix * self.profile.prefix_fraction)
 
-    def admit_resident_hit(self, queue: deque[Request]) -> bool:
+    def resident_hit(self, queue: deque[Request], *, exclude: Request | None = None) -> Request | None:
         free = self.free_bytes()
         for request in islice(queue, 1, None):
+            if request is exclude:
+                continue
             job, side = request.job, request.side
             slot = job.slots[side]
             if slot.state != "idle" or not slot.resident or (side == "kv" and not self.prefix_tokens(job)):
@@ -286,14 +308,23 @@ class Simulator:
             target = self.target(request)
             if self.policy.name == "relaxed" or target - slot.resident <= free:
                 # Existing reclaim holds are charged against free space.
-                self.start_request(request, target, bypass=True)
-                return True
+                return request
+        return None
+
+    def advance_reclaim(self, queue: deque[Request], reclaim: Reclaim) -> bool:
+        if not reclaim.remaining:
+            return self.try_admit(reclaim.request)
+        hit = self.resident_hit(queue, exclude=reclaim.request)
+        if hit is not None:
+            self.start_request(hit, self.target(hit), bypass=True)
+            return True
         return False
 
     def try_admit(self, request: Request) -> bool:
         job, side = request.job, request.side
         key = self.queue_for(side)
-        self.mark_head(request)
+        if self.waiting[key][0] is request:
+            self.mark_head(request)
         slot = job.slots[side]
         if key in self.reclaims:
             reclaim = self.reclaims[key]
@@ -303,6 +334,10 @@ class Simulator:
             assert reclaim.held == reclaim.needed
             self.held[side] -= reclaim.held
             del self.reclaims[key]
+            target = self.target(request)
+            assert slot.state != "evicting" and target - slot.resident <= self.free_bytes()
+            self.start_request(request, target, oracle_bypass=reclaim.oracle_bypass)
+            return True
         target = self.target(request)
         if self.policy.name == "relaxed":
             self.start_request(request, target)
@@ -331,7 +366,23 @@ class Simulator:
             self.start_request(request, target)
             return True
 
-        block_kind = "own_eviction" if slot.state == "evicting" else "capacity"
+        self.record_block(request, needed, side_free, total_free)
+        if slot.state == "evicting":
+            return False
+
+        selected = []
+        recoverable = side_free
+        for victim, victim_side in self.eviction_candidates(request):
+            selected.append((victim, victim_side))
+            recoverable += victim.slots[victim_side].resident
+            if recoverable >= needed:
+                self.start_reclaim(request, needed, side_free, selected)
+                return True
+        return False
+
+    def record_block(self, request: Request, needed: int, side_free: int, total_free: int) -> None:
+        job, side = request.job, request.side
+        block_kind = "own_eviction" if job.slots[side].state == "evicting" else "capacity"
         block = (block_kind, needed, side_free, total_free)
         if block != request.last_block:
             request.last_block = block
@@ -348,46 +399,45 @@ class Simulator:
                 needed_bytes=needed, side_free_bytes=side_free, total_free_bytes=total_free,
                 partition_stranded=stranded, request_order=request.order,
             )
-        if slot.state == "evicting":
-            return False
-
+    def eviction_candidates(self, request: Request) -> list[tuple[Job, Side]]:
+        job, side = request.job, request.side
         eligible_sides = SIDES if self.policy.global_queue else (side,)
         # Sorting is stable, so equal per-agent timestamps use SIDES order.
-        candidates = sorted(
+        return sorted(
             ((other, victim_side) for other in self.jobs for victim_side in eligible_sides
              if (other is not job or victim_side != side)
              and other.slots[victim_side].state == "idle" and other.slots[victim_side].resident),
             key=lambda candidate: (candidate[0].slots[candidate[1]].last_used, candidate[0].id),
         )
-        selected = []
-        recoverable = side_free
-        for victim, victim_side in candidates:
-            selected.append((victim, victim_side))
-            recoverable += victim.slots[victim_side].resident
-            if recoverable >= needed:
-                break
-        if recoverable < needed:
-            return False
-
-        reclaim = Reclaim(request, needed, len(selected), side_free)
+    def start_reclaim(
+        self, request: Request, needed: int, side_free: int,
+        selected: list[tuple[Job, Side]], *, oracle_bypass: bool = False,
+    ) -> None:
+        job, side = request.job, request.side
+        key = self.queue_for(side)
+        assert key not in self.reclaims and 0 <= side_free < needed
+        reclaim = Reclaim(request, needed, len(selected), side_free, oracle_bypass)
         self.reclaims[key] = reclaim
         self.held[side] += reclaim.held
         self.record(
             "reclaim_start", job, side=side, request_order=request.order, needed_bytes=needed,
             victim_ids=[victim.id for victim, _ in selected],
             victims=[{"job_id": victim.id, "side": victim_side} for victim, victim_side in selected],
+            **({"oracle_bypass": True} if oracle_bypass else {}),
         )
         for victim, victim_side in selected:
             self.start_eviction(victim, victim_side, reclaim)
-        return True
-
-    def start_request(self, request: Request, target: int, *, bypass: bool = False) -> None:
+    def start_request(
+        self, request: Request, target: int, *, bypass: bool = False, oracle_bypass: bool = False,
+    ) -> None:
         job, side = request.job, request.side
         queue = self.waiting[self.queue_for(side)]
-        if bypass:
+        assert not (bypass and oracle_bypass)
+        if bypass or oracle_bypass:
             assert queue[0] is not request
             queue.remove(request)
-            job.counts["resident_bypass_admits"] += 1
+            counter = "oracle_bypass_admits" if oracle_bypass else "resident_bypass_admits"
+            job.counts[counter] += 1
         else:
             head = queue.popleft()
             assert head is request
@@ -396,6 +446,7 @@ class Simulator:
         self.record(
             "admit", job, side=side, prior_state=old_state, target_bytes=target,
             reservation_delta_bytes=target - old_resident, resident_bypass=bypass,
+            **({"oracle_bypass": True} if oracle_bypass else {}),
             **self.request_wait(request),
         )
         if side == "kv":
@@ -611,19 +662,31 @@ class Simulator:
         for job in batch:
             self.next_gpu_phase(job)
 
-    def run(self) -> RunResult:
+    def replay(self, until: int | None = None, *, defer_admission: Callable[[], bool] | None = None) -> bool:
+        """Advance through events, returning whether the event stream drained by the cutoff."""
         while True:
             while self.events and self.events[0][0] == self.now:
                 _, _, _, callback, args = heapq.heappop(self.events)
                 callback(*args)
-            self.admit()
+            if defer_admission is None or not defer_admission():
+                defer_admission = None
+                self.admit()
             if self.events and self.events[0][0] == self.now:
                 continue
             self.dispatch()
             if not self.events:
-                break
+                return True
+            if until is not None and self.events[0][0] > until:
+                self.now = until
+                return False
             self.now = self.events[0][0]
 
+    def run(self) -> RunResult:
+        self.replay()
+        self.finish_replay()
+        return RunResult(self.jobs, dict(self.counters), dict(self.peaks), self.now)
+
+    def finish_replay(self) -> None:
         blocked = [request for queue in self.waiting.values() for request in queue]
         assert not self.reclaims and not (self.prefill or self.decode or self.reprefill or self.gpu_batch)
         assert {request.job.id for request in blocked} == {
@@ -641,4 +704,3 @@ class Simulator:
             self.terminal(request.job, f"{request.side}_no_progress")
         assert all(self.charged(side) == 0 for side in SIDES)
         self.record("drained")
-        return RunResult(self.jobs, dict(self.counters), dict(self.peaks), self.now)

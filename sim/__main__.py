@@ -13,7 +13,9 @@ def main() -> None:
     run = subcommands.add_parser("run", help="run the matched experiment matrix")
     run.add_argument("--config", type=Path, required=True, help="Python script exposing CONFIG")
     run.add_argument("--out", type=Path, required=True, help="new run directory")
-    run.add_argument("--quick", action="store_true", help="use only the first seed and the extreme burst loads")
+    run.add_argument(
+        "--quick", action="store_true", help="run only burst at every configured concurrency with the first seed",
+    )
     plot = subcommands.add_parser("plot-memory", help="render memory timelines from an existing run")
     plot.add_argument("--run", type=Path, required=True, help="run directory containing events.jsonl.gz")
     plot.add_argument("--case", action="append", required=True, help="case ID to plot (repeatable)")

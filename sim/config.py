@@ -7,6 +7,7 @@ from pathlib import Path
 MIB = 1024 ** 2
 GIB = 1024 ** 3
 TICKS_PER_SECOND = 10 ** 9
+DEFAULT_ORACLE_WINDOW_S = 30.0
 
 
 def ticks(seconds: float) -> int:
@@ -15,6 +16,13 @@ def ticks(seconds: float) -> int:
 
 def seconds(tick_count: int) -> float:
     return tick_count / TICKS_PER_SECOND
+
+
+def oracle_window_ticks(window_s: float) -> int:
+    duration = window_s * TICKS_PER_SECOND
+    if not isfinite(duration) or duration < 1:
+        raise ValueError("oracle_window_s must be finite and at least one simulation tick")
+    return round(duration)
 
 
 @dataclass(frozen=True)
@@ -87,10 +95,12 @@ class Experiment:
     sensitivity_dram_gib: tuple[float, ...]
     sensitivity_prefix_fraction: float
     sensitivity_restore_factors: tuple[float, ...]
+    oracle_window_s: float = DEFAULT_ORACLE_WINDOW_S
 
     def validate(self) -> None:
         self.sources.validate()
         self.profile.validate()
+        oracle_window_ticks(self.oracle_window_s)
         for field in ("concurrency", "inference_splits", "seeds", "sensitivity_concurrency"):
             values = getattr(self, field)
             if any(type(value) is not int for value in values) or len(set(values)) != len(values):

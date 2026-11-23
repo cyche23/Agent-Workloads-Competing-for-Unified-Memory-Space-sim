@@ -11,7 +11,7 @@ from collections import Counter
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from .config import Experiment, GIB, Profile, seconds, ticks
+from .config import Experiment, GIB, Profile, oracle_window_ticks, seconds, ticks
 from .engine import Arrival, Policy, RunResult, Simulator
 from .report import build_comparisons, quantile, write_report
 from .trace import Trace, load_traces
@@ -24,6 +24,7 @@ JOB_COUNTS = (
     "rounds_executed", "tool_calls_executed", "prefill_tokens", "decode_tokens",
     "reused_prompt_tokens", "reprefill_tokens", "kv_evictions", "tool_evictions", "tool_restores",
     "kv_partition_blocked_requests", "tool_partition_blocked_requests", "resident_bypass_admits",
+    "oracle_bypass_admits",
 )
 FIFO_TIMERS = ("fifo_tail_wait_ns", "fifo_head_wait_ns")
 RUN_TIMERS = (
@@ -38,9 +39,17 @@ RUN_COUNTS = (
 POLICY_ADMISSION = {
     "fixed": "per_side_fifo",
     "shared": "global_fifo_with_resident_hits",
+    "oracle_fifo": "global_fifo_with_resident_hits",
+    "oracle": "bounded_lookahead_queue_reordering",
     "relaxed": "global_fifo_with_resident_hits",
 }
-POLICY_EVICTION = {"fixed": "per_side_lru", "shared": "global_lru", "relaxed": "none"}
+POLICY_EVICTION = {
+    "fixed": "per_side_lru",
+    "shared": "global_lru",
+    "oracle_fifo": "bounded_lookahead_wait_or_reclaim",
+    "oracle": "bounded_lookahead_wait_or_reclaim",
+    "relaxed": "none",
+}
 
 
 def write_json(path: Path, data) -> None:
@@ -69,8 +78,7 @@ def arrivals_for(
 def scenarios(config: Experiment, quick: bool) -> list[tuple[str, Profile, tuple[int, ...], float]]:
     main = ("burst", config.profile, config.concurrency, 0.0)
     if quick:
-        levels = tuple(sorted({min(config.concurrency), max(config.concurrency)}))
-        return [("burst", config.profile, levels, 0.0)]
+        return [main]
     result = [main, ("staggered", config.profile, config.concurrency, config.stagger_max_s)]
     subset = config.sensitivity_concurrency
     if not subset:
@@ -115,7 +123,7 @@ def measure_run(context: dict, result: RunResult) -> tuple[dict, list[dict]]:
             assert job.times["tool_execute"] == planned["planned_tool_ns"]
         assert job.terminal_at is not None
         assert job.counts["gpu_wait_during_reprefill_ns"] <= job.times["gpu_wait"]
-        if context.get("policy") in ("shared", "relaxed"):
+        if context.get("policy") in ("shared", "oracle_fifo", "oracle", "relaxed"):
             assert sum(job.counts[field] for field in FIFO_TIMERS) == (
                 job.times["kv_memory_wait"] + job.times["tool_memory_wait"]
             )
@@ -166,7 +174,12 @@ def execute(
     config: Experiment, traces: tuple[Trace, ...], out: Path, quick: bool,
 ) -> tuple[list[dict], list[dict], list[dict], dict[str, dict]]:
     policies = [Policy("fixed", share) for share in config.inference_splits]
-    policies.extend((Policy("shared"), Policy("relaxed")))
+    policies.extend((
+        Policy("shared"),
+        Policy("oracle_fifo", oracle_window_s=config.oracle_window_s),
+        Policy("oracle", oracle_window_s=config.oracle_window_s),
+        Policy("relaxed"),
+    ))
     seeds = config.seeds[:1] if quick else config.seeds
     runs, jobs, workloads, profiles = [], [], [], {}
     with (out / "events.jsonl.gz").open("wb") as file, gzip.GzipFile(
@@ -208,6 +221,8 @@ def execute(
                             "side_limit_bytes": caps,
                             "admission_policy": POLICY_ADMISSION[policy.name],
                             "eviction_policy": POLICY_EVICTION[policy.name],
+                            **({"oracle_window_ns": oracle_window_ticks(policy.oracle_window_s)}
+                               if policy.uses_oracle else {}),
                         })
                         simulation = Simulator(profile, policy, arrivals, emit).run()
                         run, participants = measure_run(context, simulation)
