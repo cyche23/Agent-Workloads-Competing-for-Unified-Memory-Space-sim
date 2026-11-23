@@ -5,10 +5,14 @@
 ## 运行
 
 需要 Python 3.10 或更新版本和本地历史 trace。仿真使用标准库，可在普通主机运行。参数入口为 [experiment_config.py](experiment_config.py)，其中的 `TRACE_ROOT` 默认指向 `~/codes/experiment-jetson`。
-
+运行单元测试
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m sim run --config experiment_config.py --out results/v2
+```
+运行仿真
+```bash
+sim_run_dir="results/sim-$(date +%Y%m%d-%H%M%S)"
+python -m sim run --config experiment_config.py --out "$sim_run_dir" --quick
 ```
 
 每次运行指定一个新目录。加上 `--quick` 可用第一个 seed 检查主配置的最低与最高并发。全量运行每进入一个场景会打印进度，`status.json` 记录执行状态。
@@ -38,13 +42,18 @@ Goodput 的分母为首个到达到最后一个任务终态之间的时间。部
 ## 内存利用率可视化
 
 使用项目专用环境和独立的绘图依赖。下面两组用同一份 16 GiB、8 并发、seed 0 的工作负载做对照。
-
+安装专用环境
+```bash
+python -m pip install -r requirements-viz.txt
+```
+运行绘制脚本
 ```bash
 conda activate aws-py310
-python -m pip install -r requirements-viz.txt
-python -m sim plot-memory --run results/v2 \
-  --case burst/n8/seed0/fixed90 --case burst/n8/seed0/shared \
-  --out results/v2-memory-viz
+python -m sim plot-memory \
+  --run "$sim_run_dir" \
+  --case burst/n8/seed0/fixed90 \
+  --case burst/n8/seed0/shared \
+  --out "${sim_run_dir}-memory"
 ```
 
 图中使用仿真分钟和 GiB。**物理驻留**为推理 KV 与工具当前占用的字节数，包含空闲或等待释放的状态。**正在执行**为当前 prefill、decode、reprefill 批次的驻留 KV，加上执行调用、读取 checkpoint 或恢复中的工具内存。磁盘排队期间，恢复内存只计入物理驻留。两条曲线的差值表示未参与当前执行的驻留量。
